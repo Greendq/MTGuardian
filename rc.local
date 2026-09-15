@@ -1,7 +1,0 @@
-#!/bin/bash
-#
-# Run MTCore Guardian in the  named screen as user mt-service
-
-/bin/su -s /bin/bash mt-service -c "/usr/bin/screen -dmS Binance bash -c '/home/mt-service/bin/MTGuardian; exec bash'"
-exit 0
-
