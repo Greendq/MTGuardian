@@ -382,7 +382,7 @@ log_event() {
 
 close_lock_fd_in_child() {
     if [[ "${LOCK_METHOD:-}" == "flock" ]]; then
-        exec 9>&- 2>/dev/null || true
+        { exec 9>&-; } 2>/dev/null || true
     fi
 }
 
@@ -1125,6 +1125,9 @@ launch_and_supervise_child() {
     (
         close_lock_fd_in_child
         cd -- "${MT_CORE_DIR}" || exit 127
+        # Under systemd the inherited stdout/stderr is the journal, which rsyslog
+        # copies unrotated into /var/log/syslog. MTCore writes its own log files.
+        [[ -n "${JOURNAL_STREAM:-}" ]] && exec >/dev/null 2>&1
         exec "${MT_CORE_DIR}/MTCore" "${CORE_ARGS[@]}"
     ) &
 
