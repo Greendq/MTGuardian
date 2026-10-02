@@ -88,6 +88,7 @@ CSC
 fi
 
 printf '%s\n' "${pid}:${MTCORE_MODE:-clean}" >> "${MTCORE_START_LOG:-/dev/null}"
+[[ -n "${MTCORE_CONSOLE:-}" ]] && { printf 'MTCORE_CONSOLE_OUT\n'; printf 'MTCORE_CONSOLE_ERR\n' >&2; }
 
 case "${MTCORE_MODE:-clean}" in
     clean)
@@ -511,6 +512,30 @@ fi
 sed -n 's/:hang$//p' "${WORK}/starts-request-restart.log" 2>/dev/null | while read -r pid; do
     [[ -n "${pid}" ]] && kill "${pid}" 2>/dev/null || true
 done
+
+printf 'Test 19: MTCore console output stays out of the systemd journal\n'
+for journal in 0 1; do
+    cleanup_test_cscdat
+    if (( journal == 1 )); then
+        JOURNAL_STREAM=8:12345 MTCORE_CONSOLE=1 MTCORE_MODE=clean bash "${MTGX}" --config "${WORK}/test.conf" >"${WORK}/console-${journal}.log" 2>&1 &
+    else
+        MTCORE_CONSOLE=1 MTCORE_MODE=clean bash "${MTGX}" --config "${WORK}/test.conf" >"${WORK}/console-${journal}.log" 2>&1 &
+    fi
+    gx=$!
+    GUARDIAN_PIDS+=( "${gx}" )
+    sleep 3
+    kill -TERM "${gx}" 2>/dev/null || true
+    wait "${gx}" 2>/dev/null || true
+done
+if ! grep -q 'MTCORE_CONSOLE_' "${WORK}/console-1.log" &&
+   grep -q 'succesfly started' "${WORK}/console-1.log" &&
+   grep -q 'MTCORE_CONSOLE_OUT' "${WORK}/console-0.log" &&
+   grep -q 'MTCORE_CONSOLE_ERR' "${WORK}/console-0.log"; then
+    pass "core output dropped under journal, kept on console"
+else
+    fail "core console routing wrong"
+    sed 's/^/    | /' "${WORK}/console-1.log" "${WORK}/console-0.log" 2>/dev/null || true
+fi
 
 printf '\n'
 if (( FAIL == 0 )); then
