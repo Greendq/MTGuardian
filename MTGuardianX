@@ -1,0 +1,1693 @@
+#!/usr/bin/env bash
+#
+# MTGuardianX v5 - profile-aware launcher, monitor, and restarter for MTCore.
+# Original MTGuardian: (c) MTSS Development aka Moontrader Development Team, 2024.
+#
+# This script is a consolidated successor to:
+#   - Greendq/MTGuardian, commit 4c746432ac11d4bd9f13990ec0390dc506fdc2e7
+#   - local MTGuardianX
+#   - local MTGuardianX.v2
+#
+# Design goals:
+#   - preserve the original MTGuardian operational flow;
+#   - guard exactly one MTCore profile per MTGuardianX process;
+#   - distinguish clean exit, ordinary crash, and SIGSEGV where Bash can know it;
+#   - send every operator message to syslog, with optional console and Telegram;
+#   - stay readable enough to audit during an incident.
+
+set -uo pipefail
+
+readonly MTGX_VERSION="5.0.1"
+readonly MTGX_NAME="MTGuardianX"
+readonly PROFILE_REGEX='^[A-Za-z0-9_][A-Za-z0-9_.-]*$'
+readonly TMP_DIR="${MTGX_TMP_DIR:-/tmp}"
+readonly DEFAULT_MONITOR_POLL_INTERVAL=2
+readonly TG_HTTP_TIMEOUT=10
+
+readonly SCRIPT_NAME="$(basename -- "${BASH_SOURCE[0]}")"
+readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
+readonly SCRIPT_PATH="${SCRIPT_DIR}/${SCRIPT_NAME}"
+
+CONFIG_FILE=""
+
+# Config defaults. The config file may override these.
+LOG_TO_CONSOLE=0
+LOGGER_TAG="mtguardianx"
+MT_CORE_SERVER_NAME="MTCore Server"
+MT_CORE_RESTART_DELAY=2
+TG_NOTIFICATIONS=0
+TG_API_TOKEN=""
+TG_CHAT_ID=""
+MT_CORE_DIR=""
+MT_CORE_ARGS=""
+MT_CORE_PROFILE=""
+MONITOR_POLL_INTERVAL="${DEFAULT_MONITOR_POLL_INTERVAL}"
+MT_CORE_MAX_RESTARTS_PER_WINDOW=5
+MT_CORE_RESTART_WINDOW_SECONDS=60
+MT_CORE_MAX_RESTART_DELAY=60
+MTGX_STATE_ROOT="/run/mtguardianx"
+MTGX_LOG_ROOT="/var/log/mtguardianx"
+MTGX_STATUS_FILE=""
+MTGX_EVENT_LOG=""
+MTGX_REPORT_LOG_LINES=1000
+MTGX_LOG_GLOBS=""
+MTGX_ALLOW_REQUEST_RESTART=0
+
+# Runtime state.
+SHUTDOWN_REQUESTED=0
+CURRENT_CORE_PID=0
+LAST_CORE_PID=0
+LAST_OUTCOME=""
+CURRENT_STATE="init"
+LOCK_METHOD=""
+LOCK_TARGET=""
+RESTART_WINDOW_STARTED=0
+RESTART_COUNT=0
+NEXT_RESTART_DELAY=0
+MT_CORE_ARGS_IS_ARRAY=0
+MTGX_LOG_GLOBS_IS_ARRAY=0
+ACTION="run"
+REQUEST_REASON=""
+REQUESTED_CORE_RESTART=0
+declare -a CORE_ARGS=()
+
+usage() {
+    cat <<EOF
+${MTGX_NAME} v${MTGX_VERSION} - MoonTrader MTCore guardian
+
+Usage:
+  ${SCRIPT_NAME} --config <file.conf>    Run with a config file
+  ${SCRIPT_NAME} --config <file.conf> --status
+                                      Print guardian/MTCore status JSON
+  ${SCRIPT_NAME} --config <file.conf> --dump-report
+                                      Print status, recent events, and log snapshot JSON
+  ${SCRIPT_NAME} --config <file.conf> --request-restart <reason>
+                                      Request a local supervised core restart
+  ${SCRIPT_NAME} --configure             Build a config file interactively
+  ${SCRIPT_NAME} --help | -h             Show this help
+  ${SCRIPT_NAME} --version | -v          Show version
+
+Required config variables:
+  LOGGER_TAG
+  MT_CORE_SERVER_NAME
+  MT_CORE_DIR
+  MT_CORE_PROFILE
+
+Optional config variables:
+  LOG_TO_CONSOLE        1 = also log to stderr, 0 = syslog only
+  MT_CORE_RESTART_DELAY Seconds to wait before restart after crash
+  TG_NOTIFICATIONS      1 = send Telegram messages, 0 = disabled
+  TG_API_TOKEN          Telegram bot token
+  TG_CHAT_ID            Space-separated Telegram chat IDs
+  MT_CORE_ARGS          Extra MTCore args; string legacy or Bash array
+  MONITOR_POLL_INTERVAL Seconds between checks in monitoring mode
+  MT_CORE_MAX_RESTARTS_PER_WINDOW
+  MT_CORE_RESTART_WINDOW_SECONDS
+  MT_CORE_MAX_RESTART_DELAY
+  MTGX_STATE_ROOT      Directory for status and request files
+  MTGX_LOG_ROOT        Directory for event logs and crash snapshots
+  MTGX_LOG_GLOBS       Extra MTCore log globs for reports/snapshots
+  MTGX_REPORT_LOG_LINES Number of MTCore log lines to snapshot (default 1000)
+
+Behavior:
+  clean exit: rc 0 and /tmp/{pid}.cscdat removed by MTCore -> monitoring mode
+  crash:      non-zero rc or stale /tmp/{pid}.cscdat -> cleanup, alert, restart
+  SIGSEGV:    child rc 139 -> alarm, cleanup, restart
+  SIGTERM:    notify and exit; MTGuardianX does not kill MTCore
+
+Note:
+  SIGSEGV-specific detection is only possible for MTCore processes launched by
+  this MTGuardianX instance. Externally attached MTCore processes can only be
+  classified by stale /tmp/{pid}.cscdat after they disappear.
+EOF
+}
+
+die() {
+    printf 'ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+is_bool() {
+    [[ "${1:-}" == "0" || "${1:-}" == "1" ]]
+}
+
+is_uint() {
+    [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
+is_positive_uint() {
+    is_uint "$1" && (( 10#$1 > 0 ))
+}
+
+sh_quote() {
+    local value="${1-}"
+    value=${value//\'/\'\\\'\'}
+    printf "'%s'" "${value}"
+}
+
+bash_assign() {
+    local name="$1"
+    local value="${2-}"
+    printf '%s=%q\n' "${name}" "${value}"
+}
+
+kv_quote() {
+    local value="${1-}"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    printf '"%s"' "${value}"
+}
+
+json_escape() {
+    local value="${1-}"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//$'\n'/\\n}"
+    value="${value//$'\r'/\\r}"
+    value="${value//$'\t'/\\t}"
+    # JSON forbids all raw U+0000..U+001F control characters. Bash cannot
+    # represent NUL; escape every other remaining control byte (including ANSI).
+    local code character escaped octal
+    for (( code=1; code<32; code++ )); do
+        printf -v escaped '\\u%04x' "${code}"
+        printf -v octal '\\%03o' "${code}"
+        printf -v character '%b' "${octal}"
+        value="${value//${character}/${escaped}}"
+    done
+    printf '%s' "${value}"
+}
+
+json_quote() {
+    printf '"%s"' "$(json_escape "${1-}")"
+}
+
+now() {
+    date
+}
+
+iso_now() {
+    date -u '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+profile_state_dir() {
+    printf '%s/%s' "${MTGX_STATE_ROOT%/}" "${MT_CORE_PROFILE}"
+}
+
+status_file_path() {
+    if [[ -n "${MTGX_STATUS_FILE:-}" ]]; then
+        printf '%s' "${MTGX_STATUS_FILE}"
+    else
+        printf '%s/status.json' "$(profile_state_dir)"
+    fi
+}
+
+event_log_path() {
+    if [[ -n "${MTGX_EVENT_LOG:-}" ]]; then
+        printf '%s' "${MTGX_EVENT_LOG}"
+    else
+        printf '%s/%s.events.jsonl' "${MTGX_LOG_ROOT%/}" "${MT_CORE_PROFILE}"
+    fi
+}
+
+crash_snapshot_path() {
+    printf '%s/%s.last-crash.log' "${MTGX_LOG_ROOT%/}" "${MT_CORE_PROFILE}"
+}
+
+restart_request_path() {
+    printf '%s/restart.request' "$(profile_state_dir)"
+}
+
+ensure_parent_dir() {
+    local path="$1"
+    local dir
+    dir="$(dirname -- "${path}")"
+    mkdir -p -- "${dir}" 2>/dev/null || return 1
+}
+
+pid_rss_kb() {
+    local pid="$1"
+    [[ -r "/proc/${pid}/status" ]] || { printf '0'; return 0; }
+    awk '/^VmRSS:/ { print $2; found=1; exit } END { if (!found) print 0 }' "/proc/${pid}/status" 2>/dev/null
+}
+
+pid_thread_count() {
+    local pid="$1"
+    [[ -r "/proc/${pid}/status" ]] || { printf '0'; return 0; }
+    awk '/^Threads:/ { print $2; found=1; exit } END { if (!found) print 0 }' "/proc/${pid}/status" 2>/dev/null
+}
+
+pid_fd_count() {
+    local pid="$1"
+    if [[ -d "/proc/${pid}/fd" ]]; then
+        find "/proc/${pid}/fd" -maxdepth 1 -type l 2>/dev/null | wc -l | tr -d ' '
+        return 0
+    fi
+    printf '0'
+}
+
+pid_age_seconds() {
+    local pid="$1"
+    ps -o etimes= -p "${pid}" 2>/dev/null | awk '{ print $1; found=1 } END { if (!found) print 0 }'
+}
+
+json_fields_array() {
+    local first=1
+    local item
+    printf '['
+    for item in "$@"; do
+        if (( first == 0 )); then
+            printf ','
+        fi
+        first=0
+        json_quote "${item}"
+    done
+    printf ']'
+}
+
+append_event_json() {
+    local event="$1"
+    shift || true
+    local path
+    path="$(event_log_path)"
+    ensure_parent_dir "${path}" || return 0
+    {
+        printf '{"ts":'
+        json_quote "$(iso_now)"
+        printf ',"epoch":%s' "$(date +%s)"
+        printf ',"event":'
+        json_quote "${event}"
+        printf ',"profile":'
+        json_quote "${MT_CORE_PROFILE:-}"
+        printf ',"server":'
+        json_quote "${MT_CORE_SERVER_NAME:-}"
+        printf ',"guardian_pid":%s' "$$"
+        printf ',"current_core_pid":%s' "${CURRENT_CORE_PID:-0}"
+        printf ',"last_core_pid":%s' "${LAST_CORE_PID:-0}"
+        printf ',"restart_count":%s' "${RESTART_COUNT:-0}"
+        printf ',"fields":'
+        json_fields_array "$@"
+        printf '}\n'
+    } >> "${path}" 2>/dev/null || true
+}
+
+write_status() {
+    local event="${1:-status}"
+    local state="${2:-${CURRENT_STATE:-unknown}}"
+    local pid="${CURRENT_CORE_PID:-0}"
+    if [[ "${pid}" == "0" && "${LAST_CORE_PID:-0}" != "0" ]]; then
+        pid="${LAST_CORE_PID}"
+    fi
+    local path tmp running rss threads fds age
+    path="$(status_file_path)"
+    ensure_parent_dir "${path}" || return 0
+    tmp="${path}.$$"
+    if [[ "${pid}" != "0" ]] && pid_is_running "${pid}"; then
+        running=true
+        rss="$(pid_rss_kb "${pid}")"
+        threads="$(pid_thread_count "${pid}")"
+        fds="$(pid_fd_count "${pid}")"
+        age="$(pid_age_seconds "${pid}")"
+    else
+        running=false
+        rss=0
+        threads=0
+        fds=0
+        age=0
+    fi
+    {
+        printf '{\n'
+        printf '  "ts": '; json_quote "$(iso_now)"; printf ',\n'
+        printf '  "epoch": %s,\n' "$(date +%s)"
+        printf '  "event": '; json_quote "${event}"; printf ',\n'
+        printf '  "state": '; json_quote "${state}"; printf ',\n'
+        printf '  "profile": '; json_quote "${MT_CORE_PROFILE:-}"; printf ',\n'
+        printf '  "server": '; json_quote "${MT_CORE_SERVER_NAME:-}"; printf ',\n'
+        printf '  "config": '; json_quote "${CONFIG_FILE:-}"; printf ',\n'
+        printf '  "guardian_pid": %s,\n' "$$"
+        printf '  "current_core_pid": %s,\n' "${CURRENT_CORE_PID:-0}"
+        printf '  "last_core_pid": %s,\n' "${LAST_CORE_PID:-0}"
+        printf '  "last_outcome": '; json_quote "${LAST_OUTCOME:-}"; printf ',\n'
+        printf '  "restart_window_started": %s,\n' "${RESTART_WINDOW_STARTED:-0}"
+        printf '  "restart_count": %s,\n' "${RESTART_COUNT:-0}"
+        printf '  "next_restart_delay": %s,\n' "${NEXT_RESTART_DELAY:-0}"
+        printf '  "process": {\n'
+        printf '    "pid": %s,\n' "${pid:-0}"
+        printf '    "running": %s,\n' "${running}"
+        printf '    "rss_kb": %s,\n' "${rss:-0}"
+        printf '    "threads": %s,\n' "${threads:-0}"
+        printf '    "fd_count": %s,\n' "${fds:-0}"
+        printf '    "age_seconds": %s\n' "${age:-0}"
+        printf '  },\n'
+        printf '  "paths": {\n'
+        printf '    "status": '; json_quote "${path}"; printf ',\n'
+        printf '    "events": '; json_quote "$(event_log_path)"; printf ',\n'
+        printf '    "crash_snapshot": '; json_quote "$(crash_snapshot_path)"; printf ',\n'
+        printf '    "restart_request": '; json_quote "$(restart_request_path)"; printf '\n'
+        printf '  }\n'
+        printf '}\n'
+    } > "${tmp}" 2>/dev/null && mv -f -- "${tmp}" "${path}" 2>/dev/null || rm -f -- "${tmp}" 2>/dev/null || true
+}
+
+log_syslog() {
+    local msg="$1"
+    if command -v logger >/dev/null 2>&1; then
+        logger -t "${LOGGER_TAG:-mtguardianx}" -- "${msg}" 2>/dev/null || true
+    elif [[ "${LOG_TO_CONSOLE:-0}" != "1" ]]; then
+        printf '[%s] %s\n' "${LOGGER_TAG:-mtguardianx}" "${msg}" >&2
+    fi
+}
+
+log_event() {
+    local event="$1"
+    shift || true
+
+    local line="mtguardianx_event=${event}"
+    line+=" version=${MTGX_VERSION}"
+    line+=" profile=$(kv_quote "${MT_CORE_PROFILE:-}")"
+    line+=" server=$(kv_quote "${MT_CORE_SERVER_NAME:-}")"
+    line+=" config=$(kv_quote "${CONFIG_FILE:-}")"
+
+    local kv
+    for kv in "$@"; do
+        line+=" ${kv}"
+    done
+
+    log_syslog "${line}"
+    append_event_json "${event}" "$@"
+    write_status "${event}" "${CURRENT_STATE:-event}"
+    if [[ "${LOG_TO_CONSOLE}" == "1" ]]; then
+        printf '[%s] %s\n' "${LOGGER_TAG}" "${line}" >&2
+    fi
+}
+
+close_lock_fd_in_child() {
+    if [[ "${LOCK_METHOD:-}" == "flock" ]]; then
+        { exec 9>&-; } 2>/dev/null || true
+    fi
+}
+
+send_telegram() {
+    local msg="$1"
+    [[ "${TG_NOTIFICATIONS}" == "1" ]] || return 0
+
+    if ! command -v curl >/dev/null 2>&1; then
+        log_syslog "!Alert: Telegram notifications are enabled but curl was not found"
+        return 0
+    fi
+
+    local chat_id
+    for chat_id in ${TG_CHAT_ID}; do
+        (
+            close_lock_fd_in_child
+            curl -fsS --max-time "${TG_HTTP_TIMEOUT}" --retry 1 --retry-delay 1 \
+                -X POST "https://api.telegram.org/bot${TG_API_TOKEN}/sendMessage" \
+                --data-urlencode "chat_id=${chat_id}" \
+                --data-urlencode "text=${msg}" \
+                --data-urlencode "disable_web_page_preview=true" \
+                >/dev/null 2>&1 || \
+                log_syslog "tg_send_failed chat=${chat_id}"
+        ) &
+    done
+}
+
+notify() {
+    local msg="$1"
+    log_syslog "${msg}"
+    if [[ "${LOG_TO_CONSOLE}" == "1" ]]; then
+        printf '[%s] %s\n' "${LOGGER_TAG}" "${msg}" >&2
+    fi
+    send_telegram "${msg}"
+}
+
+notify_event() {
+    local msg="$1"
+    local event="$2"
+    shift 2 || true
+
+    notify "${msg}"
+    log_event "${event}" "$@"
+}
+
+stat_mode() {
+    stat -c '%A' -- "$1" 2>/dev/null || stat -f '%Sp' -- "$1" 2>/dev/null || true
+}
+
+stat_uid() {
+    stat -c '%u' -- "$1" 2>/dev/null || stat -f '%u' -- "$1" 2>/dev/null || true
+}
+
+posix_mode_checks_supported() {
+    case "$(uname -s 2>/dev/null || true)" in
+        MINGW*|MSYS*|CYGWIN*)
+            [[ "${MTGX_STRICT_CONFIG_PERMS:-0}" == "1" ]]
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+}
+
+config_file_group_or_other_writable() {
+    local mode
+    posix_mode_checks_supported || return 1
+    mode="$(stat_mode "$1")"
+    [[ -n "${mode}" ]] || return 1
+    [[ "${mode:5:1}" == "w" || "${mode:8:1}" == "w" ]]
+}
+
+config_file_group_or_other_readable() {
+    local mode
+    posix_mode_checks_supported || return 1
+    mode="$(stat_mode "$1")"
+    [[ -n "${mode}" ]] || return 1
+    [[ "${mode:4:1}" == "r" || "${mode:7:1}" == "r" ]]
+}
+
+validate_config_file_safety() {
+    local cfg="$1"
+    local owner_uid current_uid
+
+    posix_mode_checks_supported || return 0
+
+    if config_file_group_or_other_writable "${cfg}"; then
+        printf 'ERROR: refusing to source group/world-writable config file: %s\n' "${cfg}" >&2
+        return 1
+    fi
+
+    owner_uid="$(stat_uid "${cfg}")"
+    current_uid="$(id -u 2>/dev/null || true)"
+    if [[ -n "${owner_uid}" && -n "${current_uid}" && "${owner_uid}" != "${current_uid}" && "${owner_uid}" != "0" ]]; then
+        printf 'ERROR: refusing to source config not owned by current user or root: %s\n' "${cfg}" >&2
+        return 1
+    fi
+
+    return 0
+}
+
+load_config() {
+    local cfg="$1"
+    [[ -r "${cfg}" ]] || die "config file is not readable: ${cfg}"
+    validate_config_file_safety "${cfg}" || exit 1
+
+    # The config file is intentionally Bash-sourceable and operator-owned.
+    # shellcheck disable=SC1090
+    source "${cfg}" || die "failed to source config file: ${cfg}"
+
+    LOG_TO_CONSOLE="${LOG_TO_CONSOLE:-0}"
+    LOGGER_TAG="${LOGGER_TAG:-mtguardianx}"
+    MT_CORE_SERVER_NAME="${MT_CORE_SERVER_NAME:-MTCore Server}"
+    MT_CORE_RESTART_DELAY="${MT_CORE_RESTART_DELAY:-2}"
+    TG_NOTIFICATIONS="${TG_NOTIFICATIONS:-0}"
+    TG_API_TOKEN="${TG_API_TOKEN:-}"
+    TG_CHAT_ID="${TG_CHAT_ID:-}"
+    MT_CORE_DIR="${MT_CORE_DIR:-}"
+
+    local mt_core_args_decl=""
+    mt_core_args_decl="$(declare -p MT_CORE_ARGS 2>/dev/null || true)"
+    if [[ "${mt_core_args_decl}" == declare\ -a* || "${mt_core_args_decl}" == declare\ -ax* ]]; then
+        MT_CORE_ARGS_IS_ARRAY=1
+    else
+        MT_CORE_ARGS_IS_ARRAY=0
+        MT_CORE_ARGS="${MT_CORE_ARGS:-}"
+    fi
+
+    MT_CORE_PROFILE="${MT_CORE_PROFILE:-}"
+    MONITOR_POLL_INTERVAL="${MONITOR_POLL_INTERVAL:-${DEFAULT_MONITOR_POLL_INTERVAL}}"
+    MT_CORE_MAX_RESTARTS_PER_WINDOW="${MT_CORE_MAX_RESTARTS_PER_WINDOW:-5}"
+    MT_CORE_RESTART_WINDOW_SECONDS="${MT_CORE_RESTART_WINDOW_SECONDS:-60}"
+    MT_CORE_MAX_RESTART_DELAY="${MT_CORE_MAX_RESTART_DELAY:-60}"
+    MTGX_STATE_ROOT="${MTGX_STATE_ROOT:-/run/mtguardianx}"
+    MTGX_LOG_ROOT="${MTGX_LOG_ROOT:-/var/log/mtguardianx}"
+    MTGX_STATUS_FILE="${MTGX_STATUS_FILE:-}"
+    MTGX_EVENT_LOG="${MTGX_EVENT_LOG:-}"
+    MTGX_REPORT_LOG_LINES="${MTGX_REPORT_LOG_LINES:-1000}"
+    MTGX_ALLOW_REQUEST_RESTART="${MTGX_ALLOW_REQUEST_RESTART:-0}"
+
+    local mtgx_log_globs_decl=""
+    mtgx_log_globs_decl="$(declare -p MTGX_LOG_GLOBS 2>/dev/null || true)"
+    if [[ "${mtgx_log_globs_decl}" == declare\ -a* || "${mtgx_log_globs_decl}" == declare\ -ax* ]]; then
+        MTGX_LOG_GLOBS_IS_ARRAY=1
+    else
+        MTGX_LOG_GLOBS_IS_ARRAY=0
+        MTGX_LOG_GLOBS="${MTGX_LOG_GLOBS:-}"
+    fi
+
+    if [[ "${TG_NOTIFICATIONS}" == "1" ]] && config_file_group_or_other_readable "${cfg}"; then
+        die "config file contains Telegram credentials; run: chmod 600 ${cfg}"
+    fi
+}
+
+validate_config() {
+    local -a errors=()
+
+    [[ -n "${LOGGER_TAG}" ]] || errors+=("LOGGER_TAG is required")
+    [[ -n "${MT_CORE_SERVER_NAME}" ]] || errors+=("MT_CORE_SERVER_NAME is required")
+    [[ -n "${MT_CORE_DIR}" ]] || errors+=("MT_CORE_DIR is required")
+    [[ -n "${MT_CORE_PROFILE}" ]] || errors+=("MT_CORE_PROFILE is required")
+
+    if [[ "${LOGGER_TAG}" =~ [[:space:]] ]]; then
+        errors+=("LOGGER_TAG must not contain whitespace")
+    fi
+
+    if ! is_bool "${LOG_TO_CONSOLE}"; then
+        errors+=("LOG_TO_CONSOLE must be 0 or 1")
+    fi
+
+    if ! is_bool "${TG_NOTIFICATIONS}"; then
+        errors+=("TG_NOTIFICATIONS must be 0 or 1")
+    fi
+
+    if ! is_uint "${MT_CORE_RESTART_DELAY}"; then
+        errors+=("MT_CORE_RESTART_DELAY must be a non-negative integer")
+    fi
+
+    if ! is_positive_uint "${MONITOR_POLL_INTERVAL}"; then
+        errors+=("MONITOR_POLL_INTERVAL must be a positive integer")
+    fi
+
+    if ! is_positive_uint "${MT_CORE_MAX_RESTARTS_PER_WINDOW}"; then
+        errors+=("MT_CORE_MAX_RESTARTS_PER_WINDOW must be a positive integer")
+    fi
+
+    if ! is_positive_uint "${MT_CORE_RESTART_WINDOW_SECONDS}"; then
+        errors+=("MT_CORE_RESTART_WINDOW_SECONDS must be a positive integer")
+    fi
+
+    if ! is_positive_uint "${MT_CORE_MAX_RESTART_DELAY}"; then
+        errors+=("MT_CORE_MAX_RESTART_DELAY must be a positive integer")
+    fi
+
+    if ! is_positive_uint "${MTGX_REPORT_LOG_LINES}"; then
+        errors+=("MTGX_REPORT_LOG_LINES must be a positive integer")
+    fi
+
+    if ! is_bool "${MTGX_ALLOW_REQUEST_RESTART}"; then
+        errors+=("MTGX_ALLOW_REQUEST_RESTART must be 0 or 1")
+    fi
+
+    if [[ -n "${MT_CORE_PROFILE}" && ! "${MT_CORE_PROFILE}" =~ ${PROFILE_REGEX} ]]; then
+        errors+=("MT_CORE_PROFILE must match ${PROFILE_REGEX}")
+    fi
+
+    if [[ "${TG_NOTIFICATIONS}" == "1" ]]; then
+        [[ -n "${TG_API_TOKEN}" ]] || errors+=("TG_API_TOKEN is required when TG_NOTIFICATIONS=1")
+        [[ -n "${TG_CHAT_ID}" ]] || errors+=("TG_CHAT_ID is required when TG_NOTIFICATIONS=1")
+        command -v curl >/dev/null 2>&1 || errors+=("curl is required when TG_NOTIFICATIONS=1")
+    fi
+
+    if (( MT_CORE_ARGS_IS_ARRAY == 1 )); then
+        local arg
+        if (( ${#MT_CORE_ARGS[@]} > 0 )); then
+            for arg in "${MT_CORE_ARGS[@]}"; do
+                if [[ "${arg}" == "--profile-name" ]]; then
+                    errors+=("MT_CORE_ARGS must not contain --profile-name; MTGuardianX adds it")
+                fi
+            done
+        fi
+    elif [[ "${MT_CORE_ARGS}" == *"--profile-name"* ]]; then
+        errors+=("MT_CORE_ARGS must not contain --profile-name; MTGuardianX adds it")
+    fi
+
+    if declare -p MT_CORE_ARGV >/dev/null 2>&1; then
+        local argv_decl
+        argv_decl="$(declare -p MT_CORE_ARGV)"
+        if [[ "${argv_decl}" != declare\ -a* && "${argv_decl}" != declare\ -ax* ]]; then
+            errors+=("MT_CORE_ARGV, if used, must be a Bash array")
+        fi
+        if (( MT_CORE_ARGS_IS_ARRAY == 1 )); then
+            errors+=("use MT_CORE_ARGS array or MT_CORE_ARGV, not both")
+        fi
+    fi
+
+    MT_CORE_DIR="${MT_CORE_DIR%/}"
+
+    if (( ${#errors[@]} > 0 )); then
+        local e
+        for e in "${errors[@]}"; do
+            printf 'ERROR: %s\n' "${e}" >&2
+        done
+        return 1
+    fi
+
+    if [[ ! -d "${MT_CORE_DIR}" ]]; then
+        printf 'ERROR: MT_CORE_DIR is not a directory: %s\n' "${MT_CORE_DIR}" >&2
+        return 2
+    fi
+
+    if [[ ! -x "${MT_CORE_DIR}/MTCore" ]]; then
+        printf 'ERROR: MTCore binary is missing or not executable: %s/MTCore\n' "${MT_CORE_DIR}" >&2
+        return 2
+    fi
+
+    MT_CORE_RESTART_DELAY=$((10#${MT_CORE_RESTART_DELAY}))
+    MONITOR_POLL_INTERVAL=$((10#${MONITOR_POLL_INTERVAL}))
+    MT_CORE_MAX_RESTARTS_PER_WINDOW=$((10#${MT_CORE_MAX_RESTARTS_PER_WINDOW}))
+    MT_CORE_RESTART_WINDOW_SECONDS=$((10#${MT_CORE_RESTART_WINDOW_SECONDS}))
+    MT_CORE_MAX_RESTART_DELAY=$((10#${MT_CORE_MAX_RESTART_DELAY}))
+    MTGX_REPORT_LOG_LINES=$((10#${MTGX_REPORT_LOG_LINES}))
+
+    if (( MT_CORE_MAX_RESTART_DELAY < MT_CORE_RESTART_DELAY )); then
+        printf 'ERROR: MT_CORE_MAX_RESTART_DELAY must be >= MT_CORE_RESTART_DELAY\n' >&2
+        return 1
+    fi
+
+    return 0
+}
+
+build_core_args() {
+    CORE_ARGS=()
+
+    if (( MT_CORE_ARGS_IS_ARRAY == 1 )); then
+        if (( ${#MT_CORE_ARGS[@]} > 0 )); then
+            CORE_ARGS=( "${MT_CORE_ARGS[@]}" )
+        fi
+    elif declare -p MT_CORE_ARGV >/dev/null 2>&1; then
+        # Optional advanced form:
+        #   MT_CORE_ARGV=(--flag "value with spaces")
+        # shellcheck disable=SC2154
+        if (( ${#MT_CORE_ARGV[@]} > 0 )); then
+            CORE_ARGS=( "${MT_CORE_ARGV[@]}" )
+        fi
+    elif [[ -n "${MT_CORE_ARGS}" ]]; then
+        # Legacy config compatibility. This intentionally behaves like the
+        # original script: MT_CORE_ARGS is split on shell whitespace.
+        # shellcheck disable=SC2206
+        CORE_ARGS=( ${MT_CORE_ARGS} )
+    fi
+
+    local arg
+    if (( ${#CORE_ARGS[@]} > 0 )); then
+        for arg in "${CORE_ARGS[@]}"; do
+            if [[ "${arg}" == "--profile-name" ]]; then
+                die "MTCore argument list must not contain --profile-name"
+            fi
+        done
+    fi
+
+    CORE_ARGS+=( "--profile-name" "${MT_CORE_PROFILE}" )
+}
+
+emit_default_log_globs() {
+    printf '%s\n' "${MT_CORE_DIR%/}/logs/*.log"
+    printf '%s\n' "${MT_CORE_DIR%/}/log/*.log"
+    printf '%s\n' "${MT_CORE_DIR%/}/../logs/core/${MT_CORE_PROFILE}"'*.log'
+    printf '%s\n' "${MT_CORE_DIR%/}/../logs/core/"'*.log'
+    printf '%s\n' "/var/log/mtcore/${MT_CORE_PROFILE}"'*.log'
+    printf '%s\n' "/var/log/mtcore/"'*.log'
+}
+
+emit_configured_log_globs() {
+    local glob
+    if (( MTGX_LOG_GLOBS_IS_ARRAY == 1 )); then
+        if (( ${#MTGX_LOG_GLOBS[@]} > 0 )); then
+            for glob in "${MTGX_LOG_GLOBS[@]}"; do
+                [[ -n "${glob}" ]] && printf '%s\n' "${glob}"
+            done
+        fi
+    elif [[ -n "${MTGX_LOG_GLOBS:-}" ]]; then
+        for glob in ${MTGX_LOG_GLOBS}; do
+            [[ -n "${glob}" ]] && printf '%s\n' "${glob}"
+        done
+    fi
+}
+
+resolve_mtcore_log_files() {
+    local glob file
+    local -a files=()
+
+    while IFS= read -r glob; do
+        [[ -n "${glob}" ]] || continue
+        while IFS= read -r file; do
+            [[ -f "${file}" ]] && files+=( "${file}" )
+        done < <(compgen -G "${glob}" || true)
+    done < <({ emit_configured_log_globs; emit_default_log_globs; } | awk 'NF && !seen[$0]++')
+
+    if (( ${#files[@]} == 0 )); then
+        return 1
+    fi
+
+    printf '%s\n' "${files[@]}" | awk '!seen[$0]++'
+}
+
+write_crash_snapshot() {
+    local outcome="$1"
+    local pid="$2"
+    local rc="$3"
+    local path tmp file
+    path="$(crash_snapshot_path)"
+    ensure_parent_dir "${path}" || return 0
+    tmp="${path}.$$"
+
+    {
+        printf 'MTGuardianX crash snapshot\n'
+        printf 'ts=%s\n' "$(iso_now)"
+        printf 'profile=%s\n' "${MT_CORE_PROFILE}"
+        printf 'server=%s\n' "${MT_CORE_SERVER_NAME}"
+        printf 'pid=%s\n' "${pid}"
+        printf 'exit_code=%s\n' "${rc}"
+        printf 'crash_class=%s\n' "${outcome}"
+        printf 'report_log_lines=%s\n' "${MTGX_REPORT_LOG_LINES}"
+        printf '\n== marker scan ==\n'
+        while IFS= read -r file; do
+            printf -- '-- %s --\n' "${file}"
+            tail -n "${MTGX_REPORT_LOG_LINES}" -- "${file}" 2>/dev/null | \
+                grep -Ein 'OutOfMemoryException|ThreadPoolExecutor|Pong timed out|TOO_MANY_REQUESTS' || true
+        done < <(resolve_mtcore_log_files || true)
+        printf '\n== log tails ==\n'
+        while IFS= read -r file; do
+            printf '\n-- %s --\n' "${file}"
+            tail -n "${MTGX_REPORT_LOG_LINES}" -- "${file}" 2>/dev/null || true
+        done < <(resolve_mtcore_log_files || true)
+    } > "${tmp}" 2>/dev/null && mv -f -- "${tmp}" "${path}" 2>/dev/null || rm -f -- "${tmp}" 2>/dev/null || true
+}
+
+print_status_json() {
+    local path
+    path="$(status_file_path)"
+    if [[ -r "${path}" ]]; then
+        cat -- "${path}"
+        return 0
+    fi
+
+    printf '{'
+    printf '"state":"unavailable"'
+    printf ',"profile":'; json_quote "${MT_CORE_PROFILE:-}"
+    printf ',"server":'; json_quote "${MT_CORE_SERVER_NAME:-}"
+    printf ',"status_unavailable":true'
+    printf ',"status_path":'; json_quote "${path}"
+    printf '}\n'
+}
+
+print_recent_events_json_array() {
+    local lines="${1:-50}"
+    local path
+    path="$(event_log_path)"
+    printf '['
+    if [[ -r "${path}" ]]; then
+        tail -n "${lines}" -- "${path}" 2>/dev/null | awk 'BEGIN { first=1 } NF { if (!first) printf ","; first=0; printf "%s", $0 }'
+    fi
+    printf ']'
+}
+
+dump_report() {
+    local status_path events_path snapshot_path
+    status_path="$(status_file_path)"
+    events_path="$(event_log_path)"
+    snapshot_path="$(crash_snapshot_path)"
+    printf '{\n'
+    printf '  "ts": '; json_quote "$(iso_now)"; printf ',\n'
+    printf '  "profile": '; json_quote "${MT_CORE_PROFILE:-}"; printf ',\n'
+    printf '  "server": '; json_quote "${MT_CORE_SERVER_NAME:-}"; printf ',\n'
+    printf '  "paths": {\n'
+    printf '    "status": '; json_quote "${status_path}"; printf ',\n'
+    printf '    "events": '; json_quote "${events_path}"; printf ',\n'
+    printf '    "crash_snapshot": '; json_quote "${snapshot_path}"; printf '\n'
+    printf '  },\n'
+    printf '  "status": '
+    print_status_json
+    printf ',\n'
+    printf '  "recent_events": '
+    print_recent_events_json_array 100
+    printf ',\n'
+    printf '  "crash_snapshot": '
+    if [[ -r "${snapshot_path}" ]]; then
+        json_quote "$(tail -n "${MTGX_REPORT_LOG_LINES}" -- "${snapshot_path}" 2>/dev/null)"
+    else
+        printf 'null'
+    fi
+    printf '\n}\n'
+}
+
+write_restart_request() {
+    local reason="${1:-operator requested restart}"
+    local path tmp
+    path="$(restart_request_path)"
+    ensure_parent_dir "${path}" || die "could not create restart request directory for ${path}"
+    tmp="${path}.$$"
+    {
+        printf '{\n'
+        printf '  "ts": '; json_quote "$(iso_now)"; printf ',\n'
+        printf '  "profile": '; json_quote "${MT_CORE_PROFILE:-}"; printf ',\n'
+        printf '  "requester_pid": %s,\n' "$$"
+        printf '  "reason": '; json_quote "${reason}"; printf '\n'
+        printf '}\n'
+    } > "${tmp}" || die "could not write restart request: ${tmp}"
+    mv -f -- "${tmp}" "${path}" || die "could not install restart request: ${path}"
+    printf 'restart request written: %s\n' "${path}"
+}
+
+consume_restart_request() {
+    local path reason
+    path="$(restart_request_path)"
+    [[ -f "${path}" ]] || return 1
+
+    reason="$(awk -F'"' '/"reason"[ \t]*:/ { print $4; found=1; exit } END { if (!found) print "local restart requested" }' "${path}" 2>/dev/null || printf 'local restart requested')"
+    if [[ "${MTGX_ALLOW_REQUEST_RESTART}" != "1" ]]; then
+        log_event "restart_request_ignored" "reason=$(kv_quote "${reason}")" "allow=0"
+        rm -f -- "${path}" 2>/dev/null || true
+        return 1
+    fi
+
+    rm -f -- "${path}" 2>/dev/null || true
+    REQUESTED_CORE_RESTART=1
+    log_event "restart_request_consumed" "reason=$(kv_quote "${reason}")"
+    return 0
+}
+
+read_cscdat_profile() {
+    local file="$1"
+    [[ -r "${file}" ]] || return 1
+
+    local profile
+    profile="$(
+        awk '
+            /^[ \t]*#/ { next }
+            {
+                key = $1
+                sub(/:.*/, "", key)
+                gsub(/^[ \t]+|[ \t]+$/, "", key)
+                if (key == "PROFILE") {
+                    value = $0
+                    sub(/^[^:]*:/, "", value)
+                    sub(/\r$/, "", value)
+                    print value
+                    exit
+                }
+            }
+        ' "${file}"
+    )"
+
+    [[ -n "${profile}" ]] || return 1
+    printf '%s' "${profile}"
+}
+
+pid_is_running() {
+    local pid="$1"
+    [[ "${pid}" =~ ^[0-9]+$ ]] || return 1
+
+    if [[ -d "/proc/${pid}" ]]; then
+        local state
+        state="$(awk '{print $3}' "/proc/${pid}/stat" 2>/dev/null || true)"
+        [[ "${state}" == "Z" ]] && return 1
+        return 0
+    fi
+
+    local err=""
+    if err="$(kill -0 "${pid}" 2>&1)"; then
+        return 0
+    fi
+
+    # If /proc is unavailable, EPERM still means the process exists.
+    err="$(printf '%s' "${err}" | tr '[:upper:]' '[:lower:]')"
+    case "${err}" in
+        *operation*not*permitted*|*operation*permitted*|*permission*denied*)
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
+find_core_pid_by_cmdline() {
+    # Fallback core discovery: match a *running* MTCore by its --profile-name
+    # command line, independent of /tmp/{pid}.cscdat. Catches a core that
+    # relaunched itself via `--wait4pid <oldpid>` and did not leave a cscdat the
+    # pid-keyed scan can match, which otherwise strands the guardian in
+    # waiting_for_core while a live core runs unsupervised. Linux /proc only;
+    # degrades to "no match" where /proc is unavailable.
+    local target="$1"
+    local entry pid cmdline
+    [[ -n "${target}" ]] || return 1
+    for entry in /proc/[0-9]*/cmdline; do
+        [[ -r "${entry}" ]] || continue
+        pid="${entry#/proc/}"
+        pid="${pid%/cmdline}"
+        [[ "${pid}" =~ ^[0-9]+$ ]] || continue
+        pid_is_running "${pid}" || continue
+        cmdline="$(tr '\0' ' ' < "${entry}" 2>/dev/null)" || continue
+        case "${cmdline}" in
+            *MTCore*) ;;
+            *) continue ;;
+        esac
+        case " ${cmdline} " in
+            *" --profile-name ${target} "*)
+                printf '%s' "${pid}"
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
+find_core_pid_for_profile() {
+    local target="$1"
+    local file pid profile
+    local -a files=()
+
+    while IFS= read -r file; do
+        [[ -n "${file}" ]] && files+=( "${file}" )
+    done < <(compgen -G "${TMP_DIR}/*.cscdat" || true)
+
+    if (( ${#files[@]} > 0 )); then
+        for file in "${files[@]}"; do
+            pid="${file##*/}"
+            pid="${pid%.cscdat}"
+            [[ "${pid}" =~ ^[0-9]+$ ]] || continue
+            pid_is_running "${pid}" || continue
+
+            profile="$(read_cscdat_profile "${file}" 2>/dev/null || true)"
+            [[ "${profile}" == "${target}" ]] || continue
+
+            printf '%s' "${pid}"
+            return 0
+        done
+    fi
+
+    # No matchable cscdat: fall back to matching a running core by command line
+    # (handles --wait4pid self-relaunch that left no pid-keyed cscdat).
+    if pid="$(find_core_pid_by_cmdline "${target}")" && [[ -n "${pid}" ]]; then
+        printf '%s' "${pid}"
+        return 0
+    fi
+
+    return 1
+}
+
+preflight_profile_files() {
+    local target="$1"
+    local file pid profile
+    local first_live_pid=""
+    local -a files=()
+
+    while IFS= read -r file; do
+        [[ -n "${file}" ]] && files+=( "${file}" )
+    done < <(compgen -G "${TMP_DIR}/*.cscdat" || true)
+
+    if (( ${#files[@]} > 0 )); then
+        for file in "${files[@]}"; do
+            pid="${file##*/}"
+            pid="${pid%.cscdat}"
+            [[ "${pid}" =~ ^[0-9]+$ ]] || continue
+
+            profile="$(read_cscdat_profile "${file}" 2>/dev/null || true)"
+            [[ "${profile}" == "${target}" ]] || continue
+
+            if pid_is_running "${pid}"; then
+                [[ -z "${first_live_pid}" ]] && first_live_pid="${pid}"
+                continue
+            fi
+
+            rm -f -- "${file}" 2>/dev/null || \
+                notify "!Alert: MTGuardian could not remove stale ${file} on [${MT_CORE_SERVER_NAME}]"
+            log_event "stale_cscdat_removed" "pid=${pid}" "file=$(kv_quote "${file}")"
+        done
+    fi
+
+    # No live same-profile cscdat: fall back to a running core matched by
+    # command line (self-relaunched via --wait4pid without a matchable cscdat).
+    if [[ -z "${first_live_pid}" ]]; then
+        first_live_pid="$(find_core_pid_by_cmdline "${target}" || true)"
+    fi
+
+    if [[ -n "${first_live_pid}" ]]; then
+        CURRENT_CORE_PID="${first_live_pid}"
+        LAST_CORE_PID="${first_live_pid}"
+        return 0
+    fi
+
+    return 1
+}
+
+cleanup_cscdat() {
+    local pid="$1"
+    local file="${TMP_DIR}/${pid}.cscdat"
+    if [[ -e "${file}" ]]; then
+        rm -f -- "${file}" 2>/dev/null || \
+            notify "!Alert: MTGuardian could not remove ${file} on [${MT_CORE_SERVER_NAME}]"
+    fi
+}
+
+classify_child_exit() {
+    local pid="$1"
+    local rc="$2"
+    local file="${TMP_DIR}/${pid}.cscdat"
+
+    if (( REQUESTED_CORE_RESTART == 1 )); then
+        cleanup_cscdat "${pid}"
+        LAST_OUTCOME="requested_restart"
+        REQUESTED_CORE_RESTART=0
+        write_crash_snapshot "${LAST_OUTCOME}" "${pid}" "${rc}"
+        return 0
+    fi
+
+    if [[ "${rc}" -eq 0 && ! -e "${file}" ]]; then
+        LAST_OUTCOME="clean"
+        return 0
+    fi
+
+    cleanup_cscdat "${pid}"
+
+    if [[ "${rc}" -eq 139 ]]; then
+        LAST_OUTCOME="sigsegv"
+    else
+        LAST_OUTCOME="crash"
+    fi
+    write_crash_snapshot "${LAST_OUTCOME}" "${pid}" "${rc}"
+}
+
+interruptible_sleep() {
+    local seconds="$1"
+    (( SHUTDOWN_REQUESTED == 1 )) && return 1
+    ( close_lock_fd_in_child; sleep "${seconds}" ) &
+    local sleep_pid=$!
+    wait "${sleep_pid}" 2>/dev/null || true
+    if (( SHUTDOWN_REQUESTED == 1 )); then
+        kill "${sleep_pid}" 2>/dev/null || true
+        wait "${sleep_pid}" 2>/dev/null || true
+        return 1
+    fi
+    return 0
+}
+
+reset_restart_window() {
+    RESTART_WINDOW_STARTED=0
+    RESTART_COUNT=0
+    NEXT_RESTART_DELAY=0
+}
+
+record_restart_attempt() {
+    local now_s
+    now_s="$(date +%s)"
+
+    if (( RESTART_WINDOW_STARTED == 0 || now_s - RESTART_WINDOW_STARTED > MT_CORE_RESTART_WINDOW_SECONDS )); then
+        RESTART_WINDOW_STARTED="${now_s}"
+        RESTART_COUNT=0
+    fi
+
+    RESTART_COUNT=$((RESTART_COUNT + 1))
+    NEXT_RESTART_DELAY="${MT_CORE_RESTART_DELAY}"
+
+    if (( RESTART_COUNT > MT_CORE_MAX_RESTARTS_PER_WINDOW )); then
+        local delay exponent
+        delay="${MT_CORE_RESTART_DELAY}"
+        (( delay < 1 )) && delay=1
+
+        exponent=$((RESTART_COUNT - MT_CORE_MAX_RESTARTS_PER_WINDOW))
+        while (( exponent > 0 )); do
+            delay=$((delay * 2))
+            (( delay >= MT_CORE_MAX_RESTART_DELAY )) && { delay="${MT_CORE_MAX_RESTART_DELAY}"; break; }
+            exponent=$((exponent - 1))
+        done
+
+        (( delay > MT_CORE_MAX_RESTART_DELAY )) && delay="${MT_CORE_MAX_RESTART_DELAY}"
+        NEXT_RESTART_DELAY="${delay}"
+    fi
+}
+
+sleep_before_restart() {
+    record_restart_attempt
+
+    if (( NEXT_RESTART_DELAY > MT_CORE_RESTART_DELAY )); then
+        notify_event \
+            "!Alert: MTGuardian restart storm detected for profile [${MT_CORE_PROFILE}] on server [${MT_CORE_SERVER_NAME}], delaying restart for [${NEXT_RESTART_DELAY}] seconds..." \
+            "restart_throttle" \
+            "restart_count=${RESTART_COUNT}" \
+            "restart_window_seconds=${MT_CORE_RESTART_WINDOW_SECONDS}" \
+            "delay_seconds=${NEXT_RESTART_DELAY}"
+    fi
+
+    interruptible_sleep "${NEXT_RESTART_DELAY}"
+}
+
+launch_and_supervise_child() {
+    CURRENT_STATE="launching"
+    write_status "launching" "${CURRENT_STATE}"
+    (
+        close_lock_fd_in_child
+        cd -- "${MT_CORE_DIR}" || exit 127
+        # Under systemd the inherited stdout/stderr is the journal, which rsyslog
+        # copies unrotated into /var/log/syslog. MTCore writes its own log files.
+        [[ -n "${JOURNAL_STREAM:-}" ]] && exec >/dev/null 2>&1
+        exec "${MT_CORE_DIR}/MTCore" "${CORE_ARGS[@]}"
+    ) &
+
+    local core_pid=$!
+    CURRENT_CORE_PID="${core_pid}"
+    LAST_CORE_PID="${core_pid}"
+
+    CURRENT_STATE="running"
+    notify "*Notice: MTCore pid [${core_pid}] on [${MT_CORE_SERVER_NAME}] succesfly started at $(now)!"
+    log_event "core_started" "pid=${core_pid}" "mode=launch"
+
+    local rc=0
+    while pid_is_running "${core_pid}"; do
+        if consume_restart_request; then
+            notify_event "*Notice: Local restart request accepted for MTCore pid [${core_pid}] on [${MT_CORE_SERVER_NAME}] at [$(now)]" "core_restart_requested" "pid=${core_pid}" "mode=launch"
+            kill -TERM "${core_pid}" 2>/dev/null || true
+        fi
+        interruptible_sleep "${MONITOR_POLL_INTERVAL}" || break
+    done
+    if (( SHUTDOWN_REQUESTED == 1 )); then
+        CURRENT_CORE_PID=0
+        LAST_OUTCOME="shutdown"
+        return 1
+    fi
+    wait "${core_pid}" 2>/dev/null || rc=$?
+    CURRENT_CORE_PID=0
+
+    classify_child_exit "${core_pid}" "${rc}"
+}
+
+wait_for_external_core() {
+    local pid=""
+    CURRENT_STATE="waiting"
+    write_status "waiting_for_core" "${CURRENT_STATE}"
+    while (( SHUTDOWN_REQUESTED == 0 )); do
+        if pid="$(find_core_pid_for_profile "${MT_CORE_PROFILE}")" && [[ -n "${pid}" ]]; then
+            CURRENT_CORE_PID="${pid}"
+            LAST_CORE_PID="${pid}"
+            return 0
+        fi
+        interruptible_sleep "${MONITOR_POLL_INTERVAL}" || return 1
+    done
+    return 1
+}
+
+monitor_external_core() {
+    local pid="$1"
+    local file="${TMP_DIR}/${pid}.cscdat"
+
+    CURRENT_STATE="monitoring"
+    write_status "monitoring" "${CURRENT_STATE}"
+    while pid_is_running "${pid}"; do
+        if consume_restart_request; then
+            notify_event "*Notice: Local restart request accepted for monitored MTCore pid [${pid}] on [${MT_CORE_SERVER_NAME}] at [$(now)]" "core_restart_requested" "pid=${pid}" "mode=monitor"
+            kill -TERM "${pid}" 2>/dev/null || true
+        fi
+        interruptible_sleep "${MONITOR_POLL_INTERVAL}" || return 2
+    done
+
+    CURRENT_CORE_PID=0
+
+    if (( REQUESTED_CORE_RESTART == 1 )); then
+        cleanup_cscdat "${pid}"
+        LAST_OUTCOME="requested_restart"
+        REQUESTED_CORE_RESTART=0
+        write_crash_snapshot "${LAST_OUTCOME}" "${pid}" "requested"
+        return 0
+    fi
+
+    if [[ -e "${file}" ]]; then
+        cleanup_cscdat "${pid}"
+        LAST_OUTCOME="crash"
+        write_crash_snapshot "${LAST_OUTCOME}" "${pid}" "external"
+    else
+        LAST_OUTCOME="clean"
+    fi
+}
+
+handle_child_outcome() {
+    local outcome="$1"
+    local pid="$2"
+
+    case "${outcome}" in
+        clean)
+            reset_restart_window
+            notify_event "*Notice: MTCore pid [${pid}] did clean exit on server [${MT_CORE_SERVER_NAME}] at [$(now)], switching to monitoring mode!" "core_clean_exit" "pid=${pid}" "mode=launch"
+            return 0
+            ;;
+        sigsegv)
+            notify_event "!Alarm: Possible runtime crash! MTCore pid [${pid}] SIGFAULT-ed on server [${MT_CORE_SERVER_NAME}] at [$(now)], trying restart..." "core_sigsegv" "pid=${pid}" "mode=launch"
+            sleep_before_restart || return 1
+            return 2
+            ;;
+        crash)
+            notify_event "!Alert: MTCore pid [${pid}] crashed on server [${MT_CORE_SERVER_NAME}] at [$(now)], trying restart..." "core_crash" "pid=${pid}" "mode=launch"
+            sleep_before_restart || return 1
+            return 2
+            ;;
+        requested_restart)
+            notify_event "*Notice: MTCore pid [${pid}] was stopped by a local restart request on server [${MT_CORE_SERVER_NAME}] at [$(now)], restarting..." "core_requested_restart" "pid=${pid}" "mode=launch"
+            sleep_before_restart || return 1
+            return 2
+            ;;
+        shutdown)
+            return 1
+            ;;
+        *)
+            notify_event "!Alert: MTGuardian internal error: unknown outcome [${outcome}]" "guardian_internal_error" "outcome=$(kv_quote "${outcome}")"
+            sleep_before_restart || return 1
+            return 2
+            ;;
+    esac
+}
+
+run_supervisor() {
+    local mode="launch"
+    local outcome
+    local ext_pid
+
+    if preflight_profile_files "${MT_CORE_PROFILE}"; then
+        mode="monitor"
+    fi
+
+    while (( SHUTDOWN_REQUESTED == 0 )); do
+        if [[ "${mode}" == "launch" ]]; then
+            launch_and_supervise_child
+            outcome="${LAST_OUTCOME}"
+            if handle_child_outcome "${outcome}" "${LAST_CORE_PID}"; then
+                mode="monitor"
+            else
+                mode="launch"
+            fi
+            continue
+        fi
+
+        log_syslog "monitoring profile [${MT_CORE_PROFILE}] on [${MT_CORE_SERVER_NAME}]"
+        wait_for_external_core || break
+
+        ext_pid="${CURRENT_CORE_PID}"
+        notify_event "*Notice: Started monitoring MTCore pid [${ext_pid}] with profile [${MT_CORE_PROFILE}] on server [${MT_CORE_SERVER_NAME}] at [$(now)]!" "core_attached" "pid=${ext_pid}" "mode=monitor"
+
+        if monitor_external_core "${ext_pid}"; then
+            outcome="${LAST_OUTCOME}"
+        else
+            outcome="shutdown"
+        fi
+        case "${outcome}" in
+            clean)
+                reset_restart_window
+                notify_event "*Notice: MTCore pid [${ext_pid}] did clean exit on server [${MT_CORE_SERVER_NAME}] at [$(now)], switching to monitoring mode!" "core_clean_exit" "pid=${ext_pid}" "mode=monitor"
+                mode="monitor"
+                ;;
+            crash)
+                notify_event "!Alert: MTCore pid [${ext_pid}] crashed on server [${MT_CORE_SERVER_NAME}] at [$(now)], trying restart..." "core_crash" "pid=${ext_pid}" "mode=monitor"
+                sleep_before_restart || break
+                mode="launch"
+                ;;
+            requested_restart)
+                notify_event "*Notice: MTCore pid [${ext_pid}] was stopped by a local restart request on server [${MT_CORE_SERVER_NAME}] at [$(now)], restarting..." "core_requested_restart" "pid=${ext_pid}" "mode=monitor"
+                sleep_before_restart || break
+                mode="launch"
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+}
+
+acquire_profile_lock() {
+    local lock_root="${TMP_DIR}/mtguardianx"
+    mkdir -p -- "${lock_root}" || die "could not create lock directory: ${lock_root}"
+
+    if command -v flock >/dev/null 2>&1; then
+        LOCK_METHOD="flock"
+        LOCK_TARGET="${lock_root}/${MT_CORE_PROFILE}.lock"
+        { exec 9>"${LOCK_TARGET}"; } 2>/dev/null || die "could not open lock file: ${LOCK_TARGET}"
+        if ! flock -n 9; then
+            die "another MTGuardianX already holds the profile lock for ${MT_CORE_PROFILE}"
+        fi
+        printf '%s\n' "$$" 1>&9
+        return 0
+    fi
+
+    LOCK_METHOD="mkdir"
+    LOCK_TARGET="${lock_root}/${MT_CORE_PROFILE}.lockdir"
+    if ! mkdir -- "${LOCK_TARGET}" 2>/dev/null; then
+        die "another MTGuardianX may already hold the profile lock for ${MT_CORE_PROFILE}"
+    fi
+    printf '%s\n' "$$" > "${LOCK_TARGET}/pid"
+}
+
+cleanup_lock() {
+    if [[ "${LOCK_METHOD}" == "mkdir" && -n "${LOCK_TARGET}" && -d "${LOCK_TARGET}" ]]; then
+        rm -rf -- "${LOCK_TARGET}" 2>/dev/null || true
+    fi
+}
+
+on_sigterm() {
+    SHUTDOWN_REQUESTED=1
+    CURRENT_STATE="shutting_down"
+    notify_event "*Notice: MTGuardian on [${MT_CORE_SERVER_NAME}] received SIG_TERM at $(now)!" "guardian_signal" "signal=SIGTERM"
+}
+
+prompt_value() {
+    local __var="$1"
+    local default="$2"
+    local question="$3"
+    local response=""
+
+    if [[ -n "${default}" ]]; then
+        read -r -p "${question} [${default}]: " response || true
+        [[ -z "${response}" ]] && response="${default}"
+    else
+        read -r -p "${question}: " response || true
+    fi
+
+    printf -v "${__var}" '%s' "${response}"
+}
+
+prompt_bool() {
+    local __var="$1"
+    local default="$2"
+    local question="$3"
+    local answer=""
+
+    while true; do
+        prompt_value answer "${default}" "${question} (0/1)"
+        if is_bool "${answer}"; then
+            printf -v "${__var}" '%s' "${answer}"
+            return 0
+        fi
+        printf '  Please enter 0 or 1.\n'
+    done
+}
+
+prompt_uint() {
+    local __var="$1"
+    local default="$2"
+    local question="$3"
+    local answer=""
+
+    while true; do
+        prompt_value answer "${default}" "${question}"
+        if is_uint "${answer}"; then
+            printf -v "${__var}" '%s' "${answer}"
+            return 0
+        fi
+        printf '  Please enter a non-negative integer.\n'
+    done
+}
+
+prompt_nonempty_no_space() {
+    local __var="$1"
+    local default="$2"
+    local question="$3"
+    local answer=""
+
+    while true; do
+        prompt_value answer "${default}" "${question}"
+        if [[ -n "${answer}" && ! "${answer}" =~ [[:space:]] ]]; then
+            printf -v "${__var}" '%s' "${answer}"
+            return 0
+        fi
+        printf '  Value cannot be empty or contain whitespace.\n'
+    done
+}
+
+prompt_profile() {
+    local __var="$1"
+    local answer=""
+
+    while true; do
+        prompt_value answer "" "MT_CORE_PROFILE (letters, digits, underscore, dot, or hyphen)"
+        if [[ "${answer}" =~ ${PROFILE_REGEX} ]]; then
+            printf -v "${__var}" '%s' "${answer}"
+            return 0
+        fi
+        printf '  Profile must match %s.\n' "${PROFILE_REGEX}"
+    done
+}
+
+run_privileged() {
+    if (( EUID == 0 )); then
+        "$@"
+    else
+        command -v sudo >/dev/null 2>&1 || die "sudo is required to update /etc/rc.local"
+        sudo "$@"
+    fi
+}
+
+install_rc_local_line() {
+    local rc_line="$1"
+    local tmp_in tmp_out
+    tmp_in="$(mktemp)" || die "mktemp failed"
+    tmp_out="$(mktemp)" || die "mktemp failed"
+
+    if run_privileged test -f /etc/rc.local; then
+        run_privileged cat /etc/rc.local > "${tmp_in}"
+    else
+        cat > "${tmp_in}" <<'EOF'
+#!/bin/sh -e
+
+exit 0
+EOF
+    fi
+
+    if grep -Fqx "${rc_line}" "${tmp_in}"; then
+        printf 'rc.local already contains this autostart line.\n'
+        rm -f -- "${tmp_in}" "${tmp_out}"
+        return 0
+    fi
+
+    awk -v line="${rc_line}" '
+        BEGIN { inserted = 0 }
+        !inserted && $0 ~ /^[[:space:]]*exit[[:space:]]+0[[:space:]]*$/ {
+            print line
+            inserted = 1
+        }
+        { print }
+        END {
+            if (!inserted) {
+                print line
+            }
+        }
+    ' "${tmp_in}" > "${tmp_out}"
+
+    run_privileged cp "${tmp_out}" /etc/rc.local
+    run_privileged chmod +x /etc/rc.local
+    rm -f -- "${tmp_in}" "${tmp_out}"
+}
+
+configure_interactive() {
+    printf '=== %s interactive configuration ===\n\n' "${MTGX_NAME}"
+
+    local v_log_to_console v_logger_tag v_server_name v_restart_delay
+    local v_tg_notifications v_tg_api_token v_tg_chat_id
+    local v_mtcore_dir v_mtcore_args v_mtcore_profile
+
+    prompt_bool v_log_to_console "1" "Log to console in addition to syslog"
+    prompt_nonempty_no_space v_logger_tag "mtguardianx" "LOGGER_TAG"
+    prompt_value v_server_name "My server" "MT_CORE_SERVER_NAME"
+    prompt_uint v_restart_delay "2" "MT_CORE_RESTART_DELAY seconds"
+    prompt_bool v_tg_notifications "0" "Enable Telegram notifications"
+
+    v_tg_api_token=""
+    v_tg_chat_id=""
+    if [[ "${v_tg_notifications}" == "1" ]]; then
+        prompt_value v_tg_api_token "" "TG_API_TOKEN"
+        prompt_value v_tg_chat_id "" "TG_CHAT_ID (space-separated)"
+    fi
+
+    prompt_value v_mtcore_dir "/home/mt-service/monitoring/simulation/" "MT_CORE_DIR"
+    prompt_value v_mtcore_args "--no-update " "MT_CORE_ARGS (without --profile-name)"
+    prompt_profile v_mtcore_profile
+
+    local conf_name
+    prompt_value conf_name "${v_mtcore_profile}" "Config file name"
+    conf_name="${conf_name//\//_}"
+    conf_name="${conf_name//\\/_}"
+    [[ "${conf_name}" == *.conf ]] || conf_name="${conf_name}.conf"
+
+    local conf_path="${PWD}/${conf_name}"
+
+    {
+        cat <<EOF
+#START of MTGuardianX config file
+# MTGuardianX section
+
+# This variable indicate if we *additionally* will log all messages to the (vistual) console, logging to syslog is ALWAYS ON
+LOG_TO_CONSOLE=${v_log_to_console}
+
+# This variable defines logger tag - will be added to the log line in syslog - you can use the same name as for profile name or whatever but no spaces!
+EOF
+        bash_assign "LOGGER_TAG" "${v_logger_tag}"
+        cat <<EOF
+
+# This variable defines server name which will be used in the notification messages. Here you can write ANYTHING what you want to be known for your server name
+EOF
+        bash_assign "MT_CORE_SERVER_NAME" "${v_server_name}"
+        cat <<EOF
+
+# This variable indicates how long time (in seconds) MTGuardianX will wait before perform MTCore instanse restart with the same profile
+MT_CORE_RESTART_DELAY=${v_restart_delay}
+
+# Restart storm protection. If MTCore crashes more than this many times inside the window, MTGuardianX applies exponential backoff up to the max delay.
+MT_CORE_MAX_RESTARTS_PER_WINDOW=5
+MT_CORE_RESTART_WINDOW_SECONDS=60
+MT_CORE_MAX_RESTART_DELAY=60
+
+# Operator state/reporting. These writes are best-effort and do not control restart reliability.
+MTGX_STATE_ROOT=/run/mtguardianx
+MTGX_LOG_ROOT=/var/log/mtguardianx
+MTGX_REPORT_LOG_LINES=1000
+MTGX_ALLOW_REQUEST_RESTART=0
+
+# TG notifications section
+# This variable indicate if we need to send Telegram (TG) notifications. Change to 0 if you do not need TG notifications at all.
+TG_NOTIFICATIONS=${v_tg_notifications}
+
+# Here you must add TG API token and your chat ID in case you want TG notifications. Check TG documentation for more details how to get API token and Chat ID
+# This variable contain TG API token
+EOF
+        bash_assign "TG_API_TOKEN" "${v_tg_api_token}"
+        cat <<EOF
+
+# This variable contain LIST of the channels where we need to send notifications
+EOF
+        bash_assign "TG_CHAT_ID" "${v_tg_chat_id}"
+        cat <<EOF
+
+# MTCore section
+# This variable contain full path to MTCore. In case you are using different versions (builds) - you can define a custom path to the MTCore
+EOF
+        bash_assign "MT_CORE_DIR" "${v_mtcore_dir}"
+        cat <<EOF
+
+# This variable contain *additional* options which should be passed to MTCore.
+# MTCore options can include any admisible parameters, except profile name - profile name will be added using MT_CORE_PROFILE name as --profile-name \${MT_CORE_PROFILE}
+EOF
+        bash_assign "MT_CORE_ARGS" "${v_mtcore_args}"
+        cat <<EOF
+
+# This variable contains profile name for MTCore. It will be used to monitor ONLY this MTCore instance.
+EOF
+        bash_assign "MT_CORE_PROFILE" "${v_mtcore_profile}"
+        cat <<EOF
+#END of MTGuardianX config file
+EOF
+    } > "${conf_path}"
+
+    chmod 600 "${conf_path}" 2>/dev/null || true
+    printf '\nConfig written to: %s\n' "${conf_path}"
+
+    if ! command -v screen >/dev/null 2>&1; then
+        printf 'screen was not found, so /etc/rc.local autostart was not offered.\n'
+        return 0
+    fi
+
+    local add_rc
+    read -r -p "Add this MTGuardianX config to /etc/rc.local using screen? [y/N]: " add_rc || true
+    add_rc="$(printf '%s' "${add_rc}" | tr '[:upper:]' '[:lower:]')"
+    case "${add_rc}" in
+        y|yes)
+            ;;
+        *)
+            printf 'Skipping /etc/rc.local integration.\n'
+            return 0
+            ;;
+    esac
+
+    local screen_name run_user
+    prompt_nonempty_no_space screen_name "mtcore-${v_mtcore_profile}" "screen session name"
+    prompt_nonempty_no_space run_user "${SUDO_USER:-${USER:-mt-service}}" "user to run MTGuardianX"
+
+    local abs_conf screen_bin su_bin guardian_cmd screen_cmd rc_line
+    abs_conf="$(cd -- "$(dirname -- "${conf_path}")" && pwd -P)/$(basename -- "${conf_path}")"
+    screen_bin="$(command -v screen 2>/dev/null || printf '/usr/bin/screen')"
+    su_bin="$(command -v su 2>/dev/null || printf '/bin/su')"
+
+    guardian_cmd="$(sh_quote "${SCRIPT_PATH}") --config $(sh_quote "${abs_conf}")"
+    screen_cmd="$(sh_quote "${screen_bin}") -dmS $(sh_quote "${screen_name}") ${guardian_cmd}"
+    rc_line="$(sh_quote "${su_bin}") -s /bin/bash $(sh_quote "${run_user}") -c $(sh_quote "${screen_cmd}")"
+
+    printf '\nWill add this line before exit 0 in /etc/rc.local:\n  %s\n\n' "${rc_line}"
+    local confirm
+    read -r -p "Proceed? [y/N]: " confirm || true
+    confirm="$(printf '%s' "${confirm}" | tr '[:upper:]' '[:lower:]')"
+    case "${confirm}" in
+        y|yes)
+            install_rc_local_line "${rc_line}"
+            printf 'Autostart line installed in /etc/rc.local.\n'
+            printf 'On systemd distributions, verify rc-local.service is enabled and active.\n'
+            ;;
+        *)
+            printf 'Aborted /etc/rc.local modification.\n'
+            ;;
+    esac
+}
+
+main() {
+    if (( $# == 0 )); then
+        usage
+        exit 1
+    fi
+
+    while (( $# > 0 )); do
+        case "$1" in
+            --config)
+                [[ -n "${2:-}" ]] || die "--config requires a file path"
+                CONFIG_FILE="$2"
+                shift 2
+                ;;
+            --status)
+                ACTION="status"
+                shift
+                ;;
+            --dump-report)
+                ACTION="dump_report"
+                shift
+                ;;
+            --request-restart)
+                [[ -n "${2:-}" ]] || die "--request-restart requires a reason"
+                ACTION="request_restart"
+                REQUEST_REASON="$2"
+                shift 2
+                ;;
+            --configure)
+                configure_interactive
+                exit 0
+                ;;
+            --help|-h)
+                usage
+                exit 0
+                ;;
+            --version|-v)
+                printf '%s %s\n' "${MTGX_NAME}" "${MTGX_VERSION}"
+                exit 0
+                ;;
+            *)
+                printf 'ERROR: unknown argument: %s\n\n' "$1" >&2
+                usage
+                exit 1
+                ;;
+        esac
+    done
+
+    [[ -n "${CONFIG_FILE}" ]] || die "--config is required"
+
+    load_config "${CONFIG_FILE}"
+    validate_config
+    local config_rc=$?
+    (( config_rc == 0 )) || exit "${config_rc}"
+    build_core_args
+
+    case "${ACTION}" in
+        status)
+            print_status_json
+            exit 0
+            ;;
+        dump_report)
+            dump_report
+            exit 0
+            ;;
+        request_restart)
+            write_restart_request "${REQUEST_REASON}"
+            exit 0
+            ;;
+        run)
+            ;;
+        *)
+            die "unknown action: ${ACTION}"
+            ;;
+    esac
+
+    trap cleanup_lock EXIT
+    trap on_sigterm TERM INT
+
+    acquire_profile_lock
+    run_supervisor
+}
+
+main "$@"

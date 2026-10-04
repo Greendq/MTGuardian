@@ -1,0 +1,26 @@
+[Unit]
+Description=MTGuardianX profile guardian for %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mt-service
+Group=mt-service
+WorkingDirectory=/home/mt-service
+ExecStart=/usr/local/bin/MTGuardianX --config /etc/mtguardianx/%i.conf
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+# Match %i to MT_CORE_PROFILE and keep these aligned with the config roots.
+RuntimeDirectory=mtguardianx/%i
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+LogsDirectory=mtguardianx
+LogsDirectoryMode=0750
+# TERM of the guardian must leave MTCore alive for a replacement to attach.
+# Stopping this service does not stop MTCore; manage core shutdown separately.
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target
